@@ -113,29 +113,29 @@ class MultiView3DReconstructor:
         
         return available_devices
 
-def setup_depth_model(self, depth_model: str):
-    """
-    Setup depth estimation model with multi-device support
-    """
-    try:
-        self.depth_processors = {}
-        self.depth_models = {}
-        
-        # Setup depth models for each device
-        for device in self.devices:
-            # Depth Model setup
-            depth_processor = GLPNImageProcessor.from_pretrained(depth_model)
-            depth_model_instance = GLPNForDepthEstimation.from_pretrained(depth_model).to(device)
-            depth_model_instance.eval()  # Set to evaluation mode
-            
-            self.depth_processors[device] = depth_processor
-            self.depth_models[device] = depth_model_instance
-        
-        logger.info("Depth model initialized successfully.")
+    def setup_depth_model(self, depth_model: str):
+      """
+      Setup depth estimation model with multi-device support
+      """
+      try:
+          self.depth_processors = {}
+          self.depth_models = {}
+          
+          # Setup depth models for each device
+          for device in self.devices:
+              # Depth Model setup
+              depth_processor = GLPNImageProcessor.from_pretrained(depth_model)
+              depth_model_instance = GLPNForDepthEstimation.from_pretrained(depth_model).to(device)
+              depth_model_instance.eval()  # Set to evaluation mode
+              
+              self.depth_processors[device] = depth_processor
+              self.depth_models[device] = depth_model_instance
+          
+          logger.info("Depth model initialized successfully.")
     
-    except Exception as e:
-        logger.error(f"Depth model initialization failed: {e}")
-        raise
+      except Exception as e:
+          logger.error(f"Depth model initialization failed: {e}")
+          raise
 
 
     def setup_multi_view_model(self, multi_view_model: str):
@@ -165,30 +165,61 @@ def setup_depth_model(self, depth_model: str):
             logger.error(f"Multi-view model initialization failed: {e}")
             raise
 
-    def preprocess_image(self, image: Union[Image.Image, np.ndarray], resize_dims=(224, 224)) -> Image.Image:
-        """
-        Advanced image preprocessing with multiple enhancement techniques
-        """
-        try:
-            # Convert numpy array to PIL Image if needed
-            if isinstance(image, np.ndarray):
-                image = Image.fromarray(image)
-            
-            # Ensure RGB mode
-            image = image.convert('RGB')
-            
-            # Resize with high-quality resampling
-            image = image.resize(resize_dims, Image.LANCZOS)
-            
-            # Optional enhancements
-            image = ImageOps.autocontrast(image, cutoff=1)  # Enhance contrast
-            image = ImageOps.equalize(image)  # Equalize histogram
-            
-            return image
-        
-        except Exception as e:
-            logger.error(f"Image preprocessing failed: {e}")
-            raise
+    def process_image(self, 
+                  image: Union[Image.Image, np.ndarray], 
+                  resize_dims=(224, 224),
+                  autocontrast=True, 
+                  equalize=True) -> Tuple[Image.Image, str]:
+      """
+      Advanced image preprocessing with multiple enhancement techniques
+      """
+      try:
+          # Validate input
+          if not isinstance(image, (Image.Image, np.ndarray)):
+              raise ValueError("Input must be a PIL Image or a NumPy array.")
+          
+          # Convert numpy array to PIL Image if needed
+          if isinstance(image, np.ndarray):
+              if image.ndim == 2:  # Grayscale
+                  image = Image.fromarray(image, mode='L')
+              elif image.shape[2] == 3:  # RGB
+                  image = Image.fromarray(image, mode='RGB')
+              elif image.shape[2] == 4:  # RGBA
+                  image = Image.fromarray(image, mode='RGBA')
+              else:
+                  raise ValueError("Unsupported array shape for image conversion.")
+          
+          # Ensure RGB mode
+          if image.mode != 'RGB':
+              image = image.convert('RGB')
+          
+          # Log original dimensions
+          logger.debug(f"Original image size: {image.size}, mode: {image.mode}")
+          
+          # Resize with high-quality resampling
+          image = image.resize(resize_dims, Image.LANCZOS)
+          
+          # Optional enhancements
+          if autocontrast:
+              image = ImageOps.autocontrast(image, cutoff=1)
+          if equalize:
+              image = ImageOps.equalize(image)
+          
+          # Log processed dimensions
+          logger.debug(f"Processed image size: {resize_dims}, mode: {image.mode}")
+          
+          # Save the processed image for validation
+          output_path = os.path.join(self.output_dir, "processed_image.png")
+          image.save(output_path)
+          logger.info(f"Processed image saved at: {output_path}")
+          
+          return image, output_path
+
+      except Exception as e:
+          logger.error(f"Image preprocessing failed: {e}")
+          raise
+
+
 
     def estimate_depth(self, image: Image.Image, device: torch.device) -> np.ndarray:
         """
@@ -229,12 +260,11 @@ def main(image_path: str):
         logger.error(f"Error: Image path does not exist - {image_path}")
         return
     
-    # Initialize multi-view reconstructor with advanced device management
     try:
         reconstructor = MultiView3DReconstructor(
-            use_distributed=True,  # Enable distributed processing
-            num_gpus=None,  # Auto-detect GPU count
-            batch_size=4,   # Set batch processing size
+            use_distributed=True,  
+            num_gpus=None,  
+            batch_size=4,   
             output_dir="3d_reconstruction_output"  # Specify output directory
         )
     except Exception as e:
@@ -243,13 +273,18 @@ def main(image_path: str):
     
     # Process image
     try:
-        results = reconstructor.process_image(image_path)
+        input_image = Image.open(image_path)
+        processed_image, save_path = reconstructor.process_image(input_image)
+        logger.info(f"Processed image saved successfully at: {save_path}")
+
+        # Continue with 3D reconstruction (depth estimation, synthetic views, etc.)
         logger.info("3D reconstruction process completed successfully.")
-        return results
+        return processed_image, save_path
     
     except Exception as e:
         logger.error(f"3D reconstruction failed: {e}")
         return None
+
 
 def validate_dependencies():
     """
@@ -363,5 +398,3 @@ torch.set_float32_matmul_precision('high')  # Improve matrix multiplication prec
 
 
 
-
- python test.py /home/kali1/Pictures/ball.png --output-dir /home/kali1/projects/3Ddream --verbose

@@ -1,3 +1,14 @@
+from diffusers import DiffusionPipeline
+from PIL import Image
+import torch
+import numpy as np
+image_pipeline = DiffusionPipeline.from_pretrained(
+    "dylanebert/multi-view-diffusion",
+    custom_pipeline="dylanebert/multi-view-diffusion",
+    torch_dtype=torch.float16,
+    trust_remote_code=True,
+).to("cuda")
+
 
 def create_image_grid(images):
     """Utility function to create a 2x2 grid of images."""
@@ -32,7 +43,7 @@ def image_to_mv(image_path):
     return grid_img
 
 # Example Usage
-input_image_path = "/content/3D dragon without background.png"  # Replace with the path to your input image
+input_image_path = r"C:\Users\navee\OneDrive\Desktop\New folder\repos\New folder\3d fusion\images\3D dragon without background.png" 
 
 # Generate and save the output
 output_grid = image_to_mv(input_image_path)
