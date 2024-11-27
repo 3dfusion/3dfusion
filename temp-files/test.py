@@ -2,399 +2,424 @@ import os
 import torch
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import open3d as o3d
-from PIL import Image, ImageOps
-import random
-import logging
-from typing import List, Optional, Union, Tuple
-import torchvision.transforms as transforms
-
-# Advanced import for better device management
-import torch.multiprocessing as mp
-
-# Importing necessary libraries for deep learning models
-from transformers import (
-    GLPNImageProcessor, 
-    GLPNForDepthEstimation
-)
-from diffusers import StableDiffusionPipeline
+from PIL import Image
+import cv2
+from diffusers import DiffusionPipeline
+from transformers import GLPNImageProcessor, GLPNForDepthEstimation, DPTForDepthEstimation, DPTImageProcessor
 from skimage.transform import resize
-from skimage.restoration import denoise_tv_chambolle
+from scipy.ndimage import median_filter
 
-# Import SSL and requests for better network error handling
-import ssl
-import requests
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.poolmanager import PoolManager
-from requests.packages.urllib3.util.ssl_ import create_urllib3_context
-
-# Custom SSL adapter to handle certificate verification
-class CustomSSLAdapter(HTTPAdapter):
-    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        ctx = create_urllib3_context(cert_reqs=ssl.CERT_NONE)
-        self.poolmanager = PoolManager(
-            num_pools=connections,
-            maxsize=maxsize,
-            block=block,
-            ssl_version=ssl.PROTOCOL_TLS,
-            ssl_context=ctx,
-            **pool_kwargs
-        )
-
-# Advanced logging configuration
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('reconstruction_log.txt'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-class MultiView3DReconstructor:
-    def __init__(
-        self, 
-        depth_model="vinvino02/glpn-nyu",
-        multi_view_model="stabilityai/stable-diffusion-xl-base-1.0",
-        use_distributed: bool = False,
-        num_gpus: int = None,
-        batch_size: int = 4,
-        output_dir: str = "output"
-    ):
+class AdvancedMultiViewReconstructor:
+    def __init__(self, max_memory_gb=4):
         """
-        Advanced multi-view 3D reconstruction with enhanced device management and configuration
+        Initialize models for multi-view depth estimation and 3D reconstruction
+        
+        Args:
+            max_memory_gb (float): Maximum GPU memory to use
         """
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        self.output_dir = output_dir
-        
-        # Enhanced device selection with fallback mechanisms
-        self.use_distributed = use_distributed
-        self.batch_size = batch_size
-        self.devices = self._select_optimal_devices(num_gpus)
-        
-        logger.info(f"Selected Devices: {self.devices}")
-        
-        # Advanced image preprocessing transforms
-        self.image_transform = transforms.Compose([
-            transforms.Resize((224, 224)),  # Resize for consistent model input
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],  # ImageNet normalization
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-        
-        # Load models with advanced error handling and multi-device support
-        self.setup_depth_model(depth_model)
-        self.setup_multi_view_model(multi_view_model)
+        # Set device and memory management
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.max_memory_gb = max_memory_gb
+        print(f"Using device: {self.device}")
 
-    def _select_optimal_devices(self, num_gpus: Optional[int] = None) -> List[torch.device]:
-        """
-        Advanced device selection with comprehensive fallback strategy
-        """
-        available_devices = []
-        
-        # Check GPU availability
-        if torch.cuda.is_available():
-            if num_gpus is None:
-                num_gpus = torch.cuda.device_count()
-            
-            for i in range(min(num_gpus, torch.cuda.device_count())):
-                available_devices.append(torch.device(f'cuda:{i}'))
-        
-        # CPU fallback with warning
-        if not available_devices:
-            logger.warning("No CUDA devices found. Falling back to CPU processing.")
-            available_devices = [torch.device('cpu')]
-        
-        return available_devices
+        # Clear initial GPU memory
+        self.clear_gpu_memory()
 
-    def setup_depth_model(self, depth_model: str):
-      """
-      Setup depth estimation model with multi-device support
-      """
-      try:
-          self.depth_processors = {}
-          self.depth_models = {}
-          
-          # Setup depth models for each device
-          for device in self.devices:
-              # Depth Model setup
-              depth_processor = GLPNImageProcessor.from_pretrained(depth_model)
-              depth_model_instance = GLPNForDepthEstimation.from_pretrained(depth_model).to(device)
-              depth_model_instance.eval()  # Set to evaluation mode
-              
-              self.depth_processors[device] = depth_processor
-              self.depth_models[device] = depth_model_instance
-          
-          logger.info("Depth model initialized successfully.")
-    
-      except Exception as e:
-          logger.error(f"Depth model initialization failed: {e}")
-          raise
-
-
-    def setup_multi_view_model(self, multi_view_model: str):
-        """
-        Setup multi-view diffusion model with multi-device support
-        """
+        # Initialize Multi-View Diffusion Pipeline
         try:
-            # Setup session with custom SSL handling
-            session = requests.Session()
-            session.mount('https://', CustomSSLAdapter())
-            
-            self.mv_pipelines = {}
-            
-            # Setup multi-view models for each device
-            for device in self.devices:
-                pipeline = StableDiffusionPipeline.from_pretrained(
-                    multi_view_model, 
-                    use_safetensors=True,
-                    session=session
-                ).to(device)
-                pipeline.enable_attention_slicing()  # Memory optimization
-                self.mv_pipelines[device] = pipeline
-            
-            logger.info("Multi-view diffusion model initialized successfully.")
-        
+            print("Loading Multi-View Diffusion Pipeline...")
+            self.mv_pipeline = DiffusionPipeline.from_pretrained(
+                "dylanebert/multi-view-diffusion",
+                custom_pipeline="dylanebert/multi-view-diffusion",
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+            ).to(self.device)
         except Exception as e:
-            logger.error(f"Multi-view model initialization failed: {e}")
+            print(f"Error loading Multi-View Diffusion Pipeline: {e}")
+            self.clear_gpu_memory()
             raise
 
-    def process_image(self, 
-                  image: Union[Image.Image, np.ndarray], 
-                  resize_dims=(224, 224),
-                  autocontrast=True, 
-                  equalize=True) -> Tuple[Image.Image, str]:
-      """
-      Advanced image preprocessing with multiple enhancement techniques
-      """
-      try:
-          # Validate input
-          if not isinstance(image, (Image.Image, np.ndarray)):
-              raise ValueError("Input must be a PIL Image or a NumPy array.")
-          
-          # Convert numpy array to PIL Image if needed
-          if isinstance(image, np.ndarray):
-              if image.ndim == 2:  # Grayscale
-                  image = Image.fromarray(image, mode='L')
-              elif image.shape[2] == 3:  # RGB
-                  image = Image.fromarray(image, mode='RGB')
-              elif image.shape[2] == 4:  # RGBA
-                  image = Image.fromarray(image, mode='RGBA')
-              else:
-                  raise ValueError("Unsupported array shape for image conversion.")
-          
-          # Ensure RGB mode
-          if image.mode != 'RGB':
-              image = image.convert('RGB')
-          
-          # Log original dimensions
-          logger.debug(f"Original image size: {image.size}, mode: {image.mode}")
-          
-          # Resize with high-quality resampling
-          image = image.resize(resize_dims, Image.LANCZOS)
-          
-          # Optional enhancements
-          if autocontrast:
-              image = ImageOps.autocontrast(image, cutoff=1)
-          if equalize:
-              image = ImageOps.equalize(image)
-          
-          # Log processed dimensions
-          logger.debug(f"Processed image size: {resize_dims}, mode: {image.mode}")
-          
-          # Save the processed image for validation
-          output_path = os.path.join(self.output_dir, "processed_image.png")
-          image.save(output_path)
-          logger.info(f"Processed image saved at: {output_path}")
-          
-          return image, output_path
+        # Initialize Depth Estimation Models
+        try:
+            print("Loading Depth Estimation Models...")
+            # GLPN Model for depth estimation
+            self.glpn_feature_extractor = GLPNImageProcessor.from_pretrained("vinvino02/glpn-nyu")
+            self.glpn_depth_model = GLPNForDepthEstimation.from_pretrained("vinvino02/glpn-nyu").to(self.device)
 
-      except Exception as e:
-          logger.error(f"Image preprocessing failed: {e}")
-          raise
+            # DPT Model for additional depth estimation
+            self.dpt_model = DPTForDepthEstimation.from_pretrained("Intel/dpt-large").to(self.device)
+            self.dpt_processor = DPTImageProcessor.from_pretrained("Intel/dpt-large")
+        except Exception as e:
+            print(f"Error loading depth estimation models: {e}")
+            self.clear_gpu_memory()
+            raise
 
+    def clear_gpu_memory(self):
+        """
+        Clear GPU memory and perform garbage collection
+        """
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
+    def check_gpu_memory(self):
+        """
+        Check and log GPU memory usage
+        """
+        if torch.cuda.is_available():
+            total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            current_memory = torch.cuda.memory_allocated(0) / (1024**3)
+            print(f"GPU Memory - Total: {total_memory:.2f} GB, Current Usage: {current_memory:.2f} GB")
 
-    def estimate_depth(self, image: Image.Image, device: torch.device) -> np.ndarray:
+    def generate_multi_view_images(self, input_image_path):
+        """
+        Generate multiple views of the input image (front, right, left, back)
+        
+        Args:
+            input_image_path (str): Path to the input image
+        
+        Returns:
+            dict: Generated view images with predefined names
+        """
+        try:
+            # Load and preprocess input image
+            input_image = Image.open(input_image_path).convert("RGB")
+            
+            # Resize image to reduce memory usage
+            input_image = input_image.resize((512, 512))
+            input_array = np.array(input_image).astype("float32") / 255.0
+
+            # Predefined view names
+            view_names = ["front", "right", "left", "back"]
+            
+            # Generate multiple views with different parameters for varied perspectives
+            views_params = [
+                {"elevation": 0, "guidance_scale": 5},     # front view
+                {"elevation": 30, "guidance_scale": 6},    # right view
+                {"elevation": -30, "guidance_scale": 7},   # left view
+                {"elevation": 180, "guidance_scale": 8}    # back view
+            ]
+
+            # Generate views
+            generated_views = {}
+            for name, params in zip(view_names, views_params):
+                view_outputs = self.mv_pipeline(
+                    image=input_array,
+                    guidance_scale=params["guidance_scale"],
+                    num_inference_steps=20,
+                    elevation=params["elevation"],
+                )
+                
+                # Take first generated view for each perspective
+                if view_outputs and len(view_outputs) > 0:
+                    view_array = view_outputs[0]
+                    generated_view = Image.fromarray((view_array * 255).astype("uint8")).resize((512, 512))
+                    generated_views[name] = generated_view
+
+            self.clear_gpu_memory()
+            return generated_views
+
+        except Exception as e:
+            print(f"Error generating multi-view images: {e}")
+            self.clear_gpu_memory()
+            raise
+
+    def generate_multi_view_images_with_count(self, input_image_path, num_views=2):
+        """
+        Generate multiple views of the input image using Multi-View Diffusion
+        
+        Args:
+            input_image_path (str): Path to the input image
+            num_views (int): Number of views to generate
+        
+        Returns:
+            list: Generated view images
+        """
+        try:
+            # Load and preprocess input image
+            input_image = Image.open(input_image_path).convert("RGB")
+            
+            # Resize image to reduce memory usage
+            input_image = input_image.resize((512, 512))
+            input_array = np.array(input_image).astype("float32") / 255.0
+
+            # Generate multiple views
+            outputs = self.mv_pipeline(
+                image=input_array,
+                guidance_scale=5,
+                num_inference_steps=20,
+                elevation=0,
+            )
+
+            # Convert outputs to PIL Images
+            generated_views = [
+                Image.fromarray((view_array * 255).astype("uint8")).resize((512, 512))
+                for view_array in outputs[:num_views]
+            ]
+
+            self.clear_gpu_memory()
+            return generated_views
+
+        except Exception as e:
+            print(f"Error generating multi-view images: {e}")
+            self.clear_gpu_memory()
+            raise
+
+    def estimate_depth_glpn(self, image):
         """
         Estimate depth using GLPN model
+        
+        Args:
+            image (PIL.Image): Input image
+        
+        Returns:
+            np.ndarray: Depth map
+        """
+        try:
+            # Prepare inputs
+            inputs = self.glpn_feature_extractor(images=image, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.glpn_depth_model(**inputs)
+                predicted_depth = outputs.predicted_depth
+            
+            # Interpolate depth to match image size
+            prediction = torch.nn.functional.interpolate(
+                predicted_depth.unsqueeze(1),
+                size=image.size[::-1],
+                mode="bicubic",
+                align_corners=False,
+            )
+            
+            depth_map = prediction.squeeze().cpu().numpy()
+            
+            # Normalize depth map
+            depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+            
+            self.clear_gpu_memory()
+            return depth_map
+
+        except Exception as e:
+            print(f"GLPN depth estimation error: {e}")
+            self.clear_gpu_memory()
+            raise
+
+    def estimate_depth_dpt(self, image):
+        """
+        Estimate depth using DPT model
+        
+        Args:
+            image (PIL.Image): Input image
+        
+        Returns:
+            np.ndarray: Depth map
         """
         try:
             # Preprocess image
-            processor = self.depth_processors[device]
-            model = self.depth_models[device]
-            
-            # Prepare inputs
-            inputs = processor(images=image, return_tensors="pt").to(device)
+            inputs = self.dpt_processor(images=image, return_tensors="pt")
+            input_image = inputs['pixel_values'].to(self.device)
             
             # Estimate depth
             with torch.no_grad():
-                outputs = model(**inputs)
-                predicted_depth = outputs.predicted_depth
-            
+                outputs = self.dpt_model(input_image)
+                depth_prediction = outputs.predicted_depth
+                
             # Convert to numpy and normalize
-            depth_map = predicted_depth.squeeze().cpu().numpy()
-            depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+            depth_np = depth_prediction.squeeze().cpu().numpy()
+            depth_np = (depth_np - depth_np.min()) / (depth_np.max() - depth_np.min())
             
-            return depth_map
-        
+            self.clear_gpu_memory()
+            return depth_np
+
         except Exception as e:
-            logger.error(f"Depth estimation failed: {e}")
+            print(f"DPT depth estimation error: {e}")
+            self.clear_gpu_memory()
             raise
 
-    # Rest of the methods remain the same as in the previous script
-    # (generate_synthetic_views, create_point_cloud, visualize_results, process_image)
-
-def main(image_path: str):
-    """
-    Main function for advanced multi-view 3D reconstruction with enhanced device support
-    """
-    # Validate image path
-    if not os.path.exists(image_path):
-        logger.error(f"Error: Image path does not exist - {image_path}")
-        return
-    
-    try:
-        reconstructor = MultiView3DReconstructor(
-            use_distributed=True,  
-            num_gpus=None,  
-            batch_size=4,   
-            output_dir="3d_reconstruction_output"  # Specify output directory
-        )
-    except Exception as e:
-        logger.error(f"Failed to initialize reconstructor: {e}")
-        return
-    
-    # Process image
-    try:
-        input_image = Image.open(image_path)
-        processed_image, save_path = reconstructor.process_image(input_image)
-        logger.info(f"Processed image saved successfully at: {save_path}")
-
-        # Continue with 3D reconstruction (depth estimation, synthetic views, etc.)
-        logger.info("3D reconstruction process completed successfully.")
-        return processed_image, save_path
-    
-    except Exception as e:
-        logger.error(f"3D reconstruction failed: {e}")
-        return None
-
-
-def validate_dependencies():
-    """
-    Validate critical dependencies for the multi-view 3D reconstruction
-    """
-    dependencies = [
-        ('torch', torch.__version__),
-        ('transformers', None),
-        ('diffusers', None),
-        ('open3d', o3d.__version__),
-        ('matplotlib', matplotlib.__version__),
-        ('numpy', np.__version__),
-        ('PIL', Image.__version__),
-    ]
-    
-    try:
-        from transformers import __version__ as transformers_version
-        from diffusers import __version__ as diffusers_version
-    except ImportError:
-        logger.error("Critical dependencies are missing!")
-        return False
-    
-    # Update versions
-    dependencies[1] = ('transformers', transformers_version)
-    dependencies[2] = ('diffusers', diffusers_version)
-    
-    # Print dependency information
-    logger.info("Dependency Versions:")
-    for name, version in dependencies:
-        try:
-            logger.info(f"{name}: {version}")
-        except Exception:
-            logger.warning(f"Could not retrieve version for {name}")
-    
-    return True
-
-def gpu_system_check():
-    """
-    Perform a comprehensive GPU system check
-    """
-    logger.info("Performing GPU System Check...")
-    
-    # CUDA availability
-    logger.info(f"CUDA Available: {torch.cuda.is_available()}")
-    
-    if torch.cuda.is_available():
-        # GPU Details
-        logger.info(f"CUDA Device Count: {torch.cuda.device_count()}")
+    def create_point_cloud(self, rgb_image, depth_map, view_name='default'):
+        """
+        Create 3D point cloud from RGB image and depth map
         
-        for i in range(torch.cuda.device_count()):
-            logger.info(f"GPU {i} Details:")
-            logger.info(f"  Name: {torch.cuda.get_device_name(i)}")
-            logger.info(f"  Compute Capability: {torch.cuda.get_device_capability(i)}")
+        Args:
+            rgb_image (PIL.Image): RGB image
+            depth_map (np.ndarray): Depth map
+            view_name (str): Name of the view for logging
+        
+        Returns:
+            o3d.geometry.PointCloud: Generated point cloud
+        """
+        try:
+            # Convert PIL Image to numpy array
+            rgb_array = np.array(rgb_image)
             
-            # Memory details
-            total_memory = torch.cuda.get_device_properties(i).total_memory / 1e9  # Convert to GB
-            logger.info(f"  Total Memory: {total_memory:.2f} GB")
-    else:
-        logger.warning("No CUDA-capable GPU detected. Falling back to CPU processing.")
+            # Ensure depth map is the same size as RGB image
+            depth_map_resized = resize(depth_map, (rgb_array.shape[0], rgb_array.shape[1]), 
+                                       anti_aliasing=True, preserve_range=True)
+            
+            # Normalize depth map
+            depth_normalized = (depth_map_resized * 1000).astype(np.uint16)
+            
+            # Convert images to Open3D format
+            rgb_o3d = o3d.geometry.Image(rgb_array)
+            depth_o3d = o3d.geometry.Image(depth_normalized)
+            
+            # Create RGBD image
+            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                rgb_o3d, depth_o3d, 
+                depth_scale=1000.0,  # Convert to millimeters
+                convert_rgb_to_intensity=False
+            )
+            
+            # Camera intrinsics
+            height, width = rgb_array.shape[:2]
+            camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+                width=width, 
+                height=height,
+                fx=width * 0.8,  # Focal length in x direction
+                fy=height * 0.8,  # Focal length in y direction
+                cx=width / 2,     # Principal point x-coordinate
+                cy=height / 2     # Principal point y-coordinate
+            )
+            
+            # Create point cloud
+            point_cloud = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, camera_intrinsic)
+            
+            # Enhance point cloud quality
+            point_cloud.estimate_normals()
+            point_cloud.orient_normals_consistent_tangent_plane(100)
+            
+            print(f"Point cloud created for {view_name} view")
+            return point_cloud
 
-def cli():
+        except Exception as e:
+            print(f"Error creating point cloud for {view_name} view: {e}")
+            raise
+
+    def save_depth_visualization(self, depth_map, output_path):
+        """
+        Save depth map as a color-coded visualization
+        
+        Args:
+            depth_map (np.ndarray): Depth map to visualize
+            output_path (str): Path to save visualization
+        """
+        plt.figure(figsize=(10, 10))
+        plt.imshow(depth_map, cmap='plasma')
+        plt.axis('off')
+        plt.colorbar(label='Depth')
+        plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
+        plt.close()
+
+def reconstruct_3d(self, input_image_path, output_dir='3d_reconstruction_output', num_views=2, multi_perspective=False):
+        """
+        Perform complete 3D reconstruction process
+        
+        Args:
+            input_image_path (str): Path to input image
+            output_dir (str): Directory to save outputs
+            num_views (int): Number of views to generate (if not multi_perspective)
+            multi_perspective (bool): Use predefined multi-view perspectives
+        """
+        try:
+            # Clear initial GPU memory
+            self.clear_gpu_memory()
+            self.check_gpu_memory()
+
+            # Create output directories
+            os.makedirs(output_dir, exist_ok=True)
+            views_dir = os.path.join(output_dir, 'views')
+            depth_dir = os.path.join(output_dir, 'depth_maps')
+            point_cloud_dir = os.path.join(output_dir, 'point_clouds')
+            os.makedirs(views_dir, exist_ok=True)
+            os.makedirs(depth_dir, exist_ok=True)
+            os.makedirs(point_cloud_dir, exist_ok=True)
+
+            # Generate multi-view images
+            if multi_perspective:
+                generated_views = self.generate_multi_view_images(input_image_path)
+            else:
+                generated_views_list = self.generate_multi_view_images_with_count(input_image_path, num_views)
+                generated_views = {f'view_{i}': view for i, view in enumerate(generated_views_list)}
+            
+            # List to store point clouds
+            point_clouds = []
+            
+            # Process each generated view
+            for view_name, view in generated_views.items():
+                # Save view image
+                view_path = os.path.join(views_dir, f'{view_name}.png')
+                view.save(view_path)
+                
+                # Estimate depth using both models
+                depth_glpn = self.estimate_depth_glpn(view)
+                depth_dpt = self.estimate_depth_dpt(view)
+                
+                # Save depth maps
+                plt.figure(figsize=(10, 5))
+                plt.subplot(1, 2, 1)
+                plt.title('GLPN Depth Map')
+                plt.imshow(depth_glpn, cmap='plasma')
+                plt.axis('off')
+                
+                plt.subplot(1, 2, 2)
+                plt.title('DPT Depth Map')
+                plt.imshow(depth_dpt, cmap='viridis')
+                plt.axis('off')
+                
+                depth_path = os.path.join(depth_dir, f'{view_name}_depth_comparison.png')
+                plt.savefig(depth_path)
+                plt.close()
+                
+                # Create point clouds
+                point_cloud_glpn = self.create_point_cloud(view, depth_glpn, f'{view_name}_GLPN')
+                point_cloud_dpt = self.create_point_cloud(view, depth_dpt, f'{view_name}_DPT')
+                
+                # Save point clouds
+                glpn_ply_path = os.path.join(point_cloud_dir, f'{view_name}_GLPN.ply')
+                dpt_ply_path = os.path.join(point_cloud_dir, f'{view_name}_DPT.ply')
+                
+                o3d.io.write_point_cloud(glpn_ply_path, point_cloud_glpn)
+                o3d.io.write_point_cloud(dpt_ply_path, point_cloud_dpt)
+                
+                point_clouds.extend([point_cloud_glpn, point_cloud_dpt])
+            
+            # Optional: Combine point clouds if multiple views
+            if len(point_clouds) > 1:
+                combined_point_cloud = o3d.geometry.PointCloud()
+                for pc in point_clouds:
+                    combined_point_cloud += pc
+                
+                # Downsample and clean combined point cloud
+                combined_point_cloud = combined_point_cloud.voxel_down_sample(voxel_size=0.05)
+                combined_point_cloud.remove_statistical_outliers(nb_neighbors=20, std_ratio=2.0)
+                
+                # Save combined point cloud
+                combined_ply_path = os.path.join(output_dir, 'combined_point_cloud.ply')
+                o3d.io.write_point_cloud(combined_ply_path, combined_point_cloud)
+                print(f"Combined point cloud saved to {combined_ply_path}")
+            
+            print("3D reconstruction completed successfully!")
+            return point_clouds
+
+        except Exception as e:
+            print(f"Error during 3D reconstruction: {e}")
+            self.clear_gpu_memory()
+            raise
+
+def main():
     """
-    Command-line interface for multi-view 3D reconstruction
+    Example usage of AdvancedMultiViewReconstructor
     """
-    import argparse
+    reconstructor = AdvancedMultiViewReconstructor(max_memory_gb=8)
+    input_image_path = '/home/kali1/Pictures/falcon.jpeg'
     
-    parser = argparse.ArgumentParser(description="Advanced Multi-View 3D Reconstruction")
-    parser.add_argument(
-        'image_path', 
-        type=str, 
-        help='Path to the input image for 3D reconstruction'
-    )
-    parser.add_argument(
-        '--output-dir', 
-        type=str, 
-        default='3d_reconstruction_output', 
-        help='Directory to save reconstruction results'
-    )
-    parser.add_argument(
-        '--verbose', 
-        action='store_true', 
-        help='Enable verbose logging'
-    )
+    # Reconstruct with default settings (2 views)
+    reconstructor.reconstruct_3d(input_image_path)
     
-    args = parser.parse_args()
-    
-    # Configure logging based on verbosity
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Run system checks
-    if not validate_dependencies():
-        logger.error("Dependency validation failed. Please check your installation.")
-        return
-    
-    gpu_system_check()
-    
-    # Run main reconstruction process
-    main(args.image_path)
+    # Reconstruct with multi-perspective views
+    reconstructor.reconstruct_3d(input_image_path, multi_perspective=True)
 
 if __name__ == "__main__":
-    # Specify the path to your image
-    image_path = "/home/kali1/Pictures/ball.png"
-    
-    # Run CLI 
-    cli()
-
-# Additional error handling and configuration
-torch.backends.cudnn.benchmark = True  # Optimize GPU performance
-torch.set_float32_matmul_precision('high')  # Improve matrix multiplication precision   
-
-
-
+    main()
