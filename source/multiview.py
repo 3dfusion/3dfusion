@@ -66,5 +66,5 @@ def generate_front_back_views(image_path, output_dir="output_views"):
 
 # Example usage
 if __name__ == "__main__":
-    input_image_path = ""       #enter your image path
+    input_image_path = "path/to/your/input_image.png"  # Replace with your image path
     generate_front_back_views(input_image_path)
