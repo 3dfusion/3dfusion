@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from skimage.transform import resize
 from transformers import DPTForDepthEstimation, DPTImageProcessor
-
+import os
 class DepthEstimator:
     def __init__(self, model_name="Intel/dpt-large"):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
