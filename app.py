@@ -11,14 +11,14 @@ from tqdm import tqdm
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-from utils.train import instantiate_from_config
-from utils.camera import (
+from src.utils.train_util import instantiate_from_config
+from src.utils.camera_util import (
     FOV_to_intrinsics, 
     get_zero123plus_input_cameras,
     get_circular_camera_poses,
 )
-from utils.mesh import save_obj
-from utils.infer import remove_background, resize_foreground
+from src.utils.mesh_util import save_obj
+from src.utils.infer_util import remove_background, resize_foreground
 
 import tempfile
 from huggingface_hub import hf_hub_download
